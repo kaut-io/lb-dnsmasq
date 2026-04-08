@@ -2,50 +2,82 @@ name: Scan and Publish
 
 on:
   push:
-    branches: [ "master", "main" ] 
+    branches: [ "master", "main" ]
   pull_request:
-    branches: [ "master", "main" ] 
+    branches: [ "master", "main" ]
 
 env:
   REPO: ${{ github.event.repository.name }}
   DOCKER_USERNAME: ${{ vars.DOCKERHUB_USERNAME }}
   DOCKER_TOKEN: ${{ secrets.DOCKERHUB_ACCESS_TOKEN }}
   BUILD_DIR: "."
+  CORTEX_API_KEY: ${{ secrets.CORTEX_API_KEY }}
+  CORTEX_API_KEY_ID: ${{ secrets.CORTEX_API_KEY_ID }}
+  CORTEX_API_URL: https://api-ms-ccr.xdr.us.paloaltonetworks.com
 
 jobs:
-
-
-  build:
-
+  build-scan-push:
     runs-on: ubuntu-latest
 
     steps:
-    - uses: actions/checkout@v3
+      - uses: actions/checkout@v5
 
-    - name: Assign build number
-      run: |
-        echo "BUILD_ID=$(date +'%y_%m_%d')" >> $GITHUB_ENV
-    - name: Lowercase the repo name for docker hub
-      run: |
-        echo "REPO=`echo $REPO | tr '[:upper:]' '[:lower:]'`" >> $GITHUB_ENV
-    - name: Set up QEMU
-      uses: docker/setup-qemu-action@v2
-    - name: Set up Docker Buildx
-      uses: docker/setup-buildx-action@v2
-    - name: Login to Docker Hub
-      uses: docker/login-action@v2
-      with:
-        username: ${{ env.DOCKER_USERNAME }}
-        password: ${{ env.DOCKER_TOKEN }}
-    - name: Build the Docker image for scanning purposes
-      run: |
-        docker build -t "$DOCKER_USERNAME/$REPO:$BUILD_ID" $BUILD_DIR
-    - name: Build and push Docker image
-      uses: docker/build-push-action@v2
-      with:
-        context: ${{env.BUILD_DIR}}  # Path to the Dockerfile and build context
-        platforms: linux/amd64,linux/arm64  # Specify the desired platforms
-        push: true 
-        tags: |
-            ${{env.DOCKER_USERNAME}}/${{env.REPO}}:${{env.BUILD_ID}}
-            ${{env.DOCKER_USERNAME}}/${{env.REPO}}:latest
+      - name: Set build metadata
+        run: |
+          REPO_LOWER=$(echo "${REPO}" | tr '[:upper:]' '[:lower:]')
+          BUILD_ID=$(date +'%y_%m_%d')
+          IMAGE_REF="${DOCKER_USERNAME}/${REPO_LOWER}:${BUILD_ID}"
+          LATEST_REF="${DOCKER_USERNAME}/${REPO_LOWER}:latest"
+
+          echo "REPO=${REPO_LOWER}" >> "${GITHUB_ENV}"
+          echo "BUILD_ID=${BUILD_ID}" >> "${GITHUB_ENV}"
+          echo "IMAGE_REF=${IMAGE_REF}" >> "${GITHUB_ENV}"
+          echo "LATEST_REF=${LATEST_REF}" >> "${GITHUB_ENV}"
+
+      - name: Build the Docker image locally
+        run: |
+          docker build \
+            -t "${IMAGE_REF}" \
+            -t "${LATEST_REF}" \
+            "${BUILD_DIR}"
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install scan prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq
+
+      - name: Download cortexcli
+        run: |
+          crtx_resp=$(curl -fsSL "${CORTEX_API_URL}/public_api/v1/unified-cli/releases/download-link?os=linux&architecture=amd64" \
+            -H "x-xdr-auth-id: ${CORTEX_API_KEY_ID}" \
+            -H "Authorization: ${CORTEX_API_KEY}")
+          crtx_url=$(echo "${crtx_resp}" | jq -r ".signed_url")
+          curl -fsSL -o cortexcli "${crtx_url}"
+          chmod +x cortexcli
+          ./cortexcli --version
+
+      - name: Scan local image before push
+        run: |
+          ./cortexcli \
+            --api-base-url "${CORTEX_API_URL}" \
+            --api-key "${CORTEX_API_KEY}" \
+            --api-key-id "${CORTEX_API_KEY_ID}" \
+            image scan "${IMAGE_REF}"
+
+      - name: Login to Docker Hub
+        if: github.event_name == 'push'
+        uses: docker/login-action@v3
+        with:
+          username: ${{ env.DOCKER_USERNAME }}
+          password: ${{ env.DOCKER_TOKEN }}
+
+      - name: Push scanned Docker image
+        if: github.event_name == 'push'
+        run: |
+          docker push "${IMAGE_REF}"
+          docker push "${LATEST_REF}"
