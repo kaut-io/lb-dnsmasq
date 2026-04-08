@@ -26,20 +26,24 @@ jobs:
         run: |
           REPO_LOWER=$(echo "${REPO}" | tr '[:upper:]' '[:lower:]')
           BUILD_ID=$(date +'%y_%m_%d')
-          IMAGE_REF="${DOCKER_USERNAME}/${REPO_LOWER}:${BUILD_ID}"
-          LATEST_REF="${DOCKER_USERNAME}/${REPO_LOWER}:latest"
+
+          IMAGE_AMD64="${DOCKER_USERNAME}/${REPO_LOWER}:${BUILD_ID}-amd64"
+          IMAGE_ARM64="${DOCKER_USERNAME}/${REPO_LOWER}:${BUILD_ID}-arm64"
+          IMAGE_VERSION="${DOCKER_USERNAME}/${REPO_LOWER}:${BUILD_ID}"
+          IMAGE_LATEST="${DOCKER_USERNAME}/${REPO_LOWER}:latest"
 
           echo "REPO=${REPO_LOWER}" >> "${GITHUB_ENV}"
           echo "BUILD_ID=${BUILD_ID}" >> "${GITHUB_ENV}"
-          echo "IMAGE_REF=${IMAGE_REF}" >> "${GITHUB_ENV}"
-          echo "LATEST_REF=${LATEST_REF}" >> "${GITHUB_ENV}"
+          echo "IMAGE_AMD64=${IMAGE_AMD64}" >> "${GITHUB_ENV}"
+          echo "IMAGE_ARM64=${IMAGE_ARM64}" >> "${GITHUB_ENV}"
+          echo "IMAGE_VERSION=${IMAGE_VERSION}" >> "${GITHUB_ENV}"
+          echo "IMAGE_LATEST=${IMAGE_LATEST}" >> "${GITHUB_ENV}"
 
-      - name: Build the Docker image locally
-        run: |
-          docker build \
-            -t "${IMAGE_REF}" \
-            -t "${LATEST_REF}" \
-            "${BUILD_DIR}"
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
 
       - name: Set up Node.js
         uses: actions/setup-node@v4
@@ -61,13 +65,37 @@ jobs:
           chmod +x cortexcli
           ./cortexcli --version
 
-      - name: Scan local image before push
+      - name: Build amd64 image locally
+        run: |
+          docker buildx build \
+            --platform linux/amd64 \
+            --load \
+            -t "${IMAGE_AMD64}" \
+            "${BUILD_DIR}"
+
+      - name: Scan amd64 image before push
         run: |
           ./cortexcli \
             --api-base-url "${CORTEX_API_URL}" \
             --api-key "${CORTEX_API_KEY}" \
             --api-key-id "${CORTEX_API_KEY_ID}" \
-            image scan "${IMAGE_REF}"
+            image scan "${IMAGE_AMD64}"
+
+      - name: Build arm64 image locally
+        run: |
+          docker buildx build \
+            --platform linux/arm64 \
+            --load \
+            -t "${IMAGE_ARM64}" \
+            "${BUILD_DIR}"
+
+      - name: Scan arm64 image before push
+        run: |
+          ./cortexcli \
+            --api-base-url "${CORTEX_API_URL}" \
+            --api-key "${CORTEX_API_KEY}" \
+            --api-key-id "${CORTEX_API_KEY_ID}" \
+            image scan "${IMAGE_ARM64}"
 
       - name: Login to Docker Hub
         if: github.event_name == 'push'
@@ -76,8 +104,17 @@ jobs:
           username: ${{ env.DOCKER_USERNAME }}
           password: ${{ env.DOCKER_TOKEN }}
 
-      - name: Push scanned Docker image
+      - name: Push architecture images
         if: github.event_name == 'push'
         run: |
-          docker push "${IMAGE_REF}"
-          docker push "${LATEST_REF}"
+          docker push "${IMAGE_AMD64}"
+          docker push "${IMAGE_ARM64}"
+
+      - name: Publish multi-arch manifests
+        if: github.event_name == 'push'
+        run: |
+          docker buildx imagetools create \
+            -t "${IMAGE_VERSION}" \
+            -t "${IMAGE_LATEST}" \
+            "${IMAGE_AMD64}" \
+            "${IMAGE_ARM64}"
