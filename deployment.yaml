@@ -1,0 +1,228 @@
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: dnsmasq-sync
+  namespace: kube-system
+data:
+  sync.sh: |
+    #!/bin/bash
+    set -euo pipefail
+
+    HOSTS_FILE="/etc/kubernetes/hosts"
+    DNS_ZONE="${DNS_ZONE:-k8s.example.internal}"
+    POLL_INTERVAL="${POLL_INTERVAL:-30}"
+
+    log() {
+        echo "[$(date -Iseconds)] $*"
+    }
+
+    write_hosts() {
+        local temp_file
+        local entry_count=0
+        temp_file=$(mktemp "${HOSTS_FILE}.XXXXXX")
+
+        log "sync started"
+        
+        {
+            echo "# Kubernetes DNS entries - managed by k8s-dnsmasq sync"
+            echo "# $(date -Iseconds)"
+            echo ""
+        } > "$temp_file"
+        
+        while IFS=$'\t' read -r namespace name type lb_ip external_name; do
+            [[ "$type" != "LoadBalancer" && "$type" != "ExternalName" ]] && continue
+            [[ -z "$lb_ip" && -z "$external_name" ]] && continue
+            
+            fqdn="${name}.${namespace}.${DNS_ZONE}"
+            
+            if [[ -n "$lb_ip" ]]; then
+                echo "${lb_ip} ${fqdn}" >> "$temp_file"
+                entry_count=$((entry_count + 1))
+            elif [[ -n "$external_name" ]]; then
+                echo "${external_name} ${fqdn}" >> "$temp_file"
+                entry_count=$((entry_count + 1))
+            fi
+        done < <(
+            kubectl get svc -A \
+                -o jsonpath='{range .items[*]}{.metadata.namespace}{"\t"}{.metadata.name}{"\t"}{.spec.type}{"\t"}{.status.loadBalancer.ingress[*].ip}{"\t"}{.spec.externalName}{"\n"}{end}'
+        )
+        
+        mv -f "$temp_file" "$HOSTS_FILE"
+        log "wrote ${entry_count} entries to ${HOSTS_FILE}"
+        pkill -HUP dnsmasq || true
+        log "signalled dnsmasq to reload"
+    }
+
+    write_hosts
+
+    while true; do
+        sleep "$POLL_INTERVAL" &
+        wait $!
+        write_hosts
+    done
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: k8s-dnsmasq
+  namespace: kube-system
+  labels:
+    app: k8s-dnsmasq
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: k8s-dnsmasq
+  template:
+    metadata:
+      labels:
+        app: k8s-dnsmasq
+    spec:
+      serviceAccountName: k8s-dnsmasq
+      shareProcessNamespace: true
+      initContainers:
+        - name: init-hosts
+          image: debian:trixie-slim
+          command:
+            - /bin/sh
+            - -c
+            - |
+              mkdir -p /etc/kubernetes && \
+              touch /etc/kubernetes/hosts && \
+              chmod 0777 /etc/kubernetes && \
+              chmod 0666 /etc/kubernetes/hosts
+          volumeMounts:
+            - name: hosts
+              mountPath: /etc/kubernetes
+      containers:
+        - name: dnsmasq
+          image: docker.io/dukekautington/dnsmasq:latest-slim
+          imagePullPolicy: Always
+          envFrom:
+            - configMapRef:
+                name: k8s-dnsmasq-config
+          command:
+            - /bin/sh
+            - -c
+            - |
+              exec dnsmasq \
+                --no-resolv \
+                --no-poll \
+                --port=5353 \
+                --domain-needed \
+                --bogus-priv \
+                --local="/${DNS_ZONE}/" \
+                --domain="${DNS_ZONE}" \
+                --expand-hosts \
+                --addn-hosts=/etc/kubernetes/hosts \
+                --cache-size=1000 \
+                --no-daemon
+          ports:
+            - name: dns-udp
+              containerPort: 5353
+              protocol: UDP
+            - name: dns-tcp
+              containerPort: 5353
+              protocol: TCP
+          volumeMounts:
+            - name: hosts
+              mountPath: /etc/kubernetes
+          resources:
+            requests:
+              cpu: 10m
+              memory: 32Mi
+            limits:
+              memory: 64Mi
+        - name: sync
+          image: debian:trixie-slim
+          securityContext:
+            runAsUser: 0
+            runAsGroup: 0
+          envFrom:
+            - configMapRef:
+                name: k8s-dnsmasq-config
+          command:
+            - /bin/sh
+            - -c
+            - |
+              apt-get update && \
+              apt-get install -y --no-install-recommends bash ca-certificates curl procps && \
+              KUBECTL_VERSION="$(curl -fsSL https://dl.k8s.io/release/stable.txt)" && \
+              curl -fsSL -o /usr/local/bin/kubectl "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/amd64/kubectl" && \
+              chmod 0755 /usr/local/bin/kubectl && \
+              exec /bin/bash /opt/sync.sh
+          volumeMounts:
+            - name: hosts
+              mountPath: /etc/kubernetes
+            - name: sync-script
+              mountPath: /opt
+          resources:
+            requests:
+              cpu: 10m
+              memory: 32Mi
+
+      volumes:
+        - name: hosts
+          emptyDir:
+            medium: Memory
+        - name: sync-script
+          configMap:
+            name: dnsmasq-sync
+            defaultMode: 0755
+
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: k8s-dnsmasq
+  namespace: kube-system
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: k8s-dnsmasq
+rules:
+  - apiGroups: [""]
+    resources: ["services"]
+    verbs: ["get", "list", "watch"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: k8s-dnsmasq
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: k8s-dnsmasq
+subjects:
+  - kind: ServiceAccount
+    name: k8s-dnsmasq
+    namespace: kube-system
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: k8s-dnsmasq
+  namespace: kube-system
+  labels:
+    app: k8s-dnsmasq
+spec:
+  type: LoadBalancer
+  # Uncomment and set this if your environment requires a fixed LoadBalancer IP.
+  # loadBalancerIP: 172.16.11.53
+  selector:
+    app: k8s-dnsmasq
+  ports:
+    - name: dns-udp
+      port: 53
+      targetPort: 5353
+      protocol: UDP
+    - name: dns-tcp
+      port: 53
+      targetPort: 5353
+      protocol: TCP

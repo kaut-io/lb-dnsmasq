@@ -1,0 +1,11 @@
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: k8s-dnsmasq-config
+  namespace: kube-system
+data:
+  # Change this to the DNS suffix you want dnsmasq to serve for your cluster.
+  DNS_ZONE: "k8s.example.internal"
+  # Change this if you want the sync sidecar to refresh records more or less often.
+  POLL_INTERVAL: "30"
