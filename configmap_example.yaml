@@ -5,7 +5,11 @@ metadata:
   name: k8s-dnsmasq-config
   namespace: kube-system
 data:
-  # Change this to the DNS suffix you want dnsmasq to serve for your cluster.
-  DNS_ZONE: "k8s.example.internal"
-  # Change this if you want the sync sidecar to refresh records more or less often.
+  # Set this to the DNS suffix you want dnsmasq to serve for your cluster.
+  DNS_ZONE: "example.internal"
+  # Set this if you want the sync sidecar to refresh records more or less often.
   POLL_INTERVAL: "30"
+  # Set this to the namespace where Traefik runs.
+  TRAEFIK_NAMESPACE: "traefik"
+  # Set this to the Traefik service name used for ingress routing.
+  TRAEFIK_SERVICE: "traefik"

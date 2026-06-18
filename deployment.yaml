@@ -8,21 +8,83 @@ data:
   sync.sh: |
     #!/bin/bash
     set -euo pipefail
+    set -f
 
     HOSTS_FILE="/etc/kubernetes/hosts"
     DNS_ZONE="${DNS_ZONE:-k8s.example.internal}"
     POLL_INTERVAL="${POLL_INTERVAL:-30}"
+    TRAEFIK_NAMESPACE="${TRAEFIK_NAMESPACE:-traefik}"
+    TRAEFIK_SERVICE="${TRAEFIK_SERVICE:-traefik}"
 
     log() {
         echo "[$(date -Iseconds)] $*"
     }
 
+    resolve_hostname_to_ip() {
+        local hostname="$1"
+        local resolved_ip
+
+        resolved_ip="$(getent ahostsv4 "$hostname" | awk 'NR==1 { print $1; exit }')"
+        [[ -n "$resolved_ip" ]] || return 1
+        printf '%s\n' "$resolved_ip"
+    }
+
+    resolve_traefik_ip() {
+        local service_ip service_hostname cluster_ip
+
+        service_ip="$(
+            kubectl get svc -n "$TRAEFIK_NAMESPACE" "$TRAEFIK_SERVICE" \
+                -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null || true
+        )"
+        if [[ -n "$service_ip" ]]; then
+            printf '%s\n' "$service_ip"
+            return 0
+        fi
+
+        service_hostname="$(
+            kubectl get svc -n "$TRAEFIK_NAMESPACE" "$TRAEFIK_SERVICE" \
+                -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null || true
+        )"
+        if [[ -n "$service_hostname" ]]; then
+            resolve_hostname_to_ip "$service_hostname"
+            return $?
+        fi
+
+        cluster_ip="$(
+            kubectl get svc -n "$TRAEFIK_NAMESPACE" "$TRAEFIK_SERVICE" \
+                -o jsonpath='{.spec.clusterIP}' 2>/dev/null || true
+        )"
+        if [[ -n "$cluster_ip" && "$cluster_ip" != "None" ]]; then
+            printf '%s\n' "$cluster_ip"
+            return 0
+        fi
+
+        return 1
+    }
+
+    add_host_record() {
+        local temp_file="$1"
+        local ip="$2"
+        local host="$3"
+
+        [[ -z "$ip" || -z "$host" ]] && return 0
+        echo "${ip} ${host}" >> "$temp_file"
+    }
+
     write_hosts() {
         local temp_file
         local entry_count=0
+        local traefik_ip=""
         temp_file=$(mktemp "${HOSTS_FILE}.XXXXXX")
 
         log "sync started"
+
+        if ! traefik_ip="$(resolve_traefik_ip)"; then
+            log "could not resolve Traefik service ${TRAEFIK_NAMESPACE}/${TRAEFIK_SERVICE}"
+            traefik_ip=""
+        else
+            log "resolved Traefik service ${TRAEFIK_NAMESPACE}/${TRAEFIK_SERVICE} to ${traefik_ip}"
+        fi
         
         {
             echo "# Kubernetes DNS entries - managed by k8s-dnsmasq sync"
@@ -33,20 +95,54 @@ data:
         while IFS=$'\t' read -r namespace name type lb_ip external_name; do
             [[ "$type" != "LoadBalancer" && "$type" != "ExternalName" ]] && continue
             [[ -z "$lb_ip" && -z "$external_name" ]] && continue
-            
+
             fqdn="${name}.${namespace}.${DNS_ZONE}"
-            
+
             if [[ -n "$lb_ip" ]]; then
-                echo "${lb_ip} ${fqdn}" >> "$temp_file"
+                add_host_record "$temp_file" "$lb_ip" "$fqdn"
                 entry_count=$((entry_count + 1))
             elif [[ -n "$external_name" ]]; then
-                echo "${external_name} ${fqdn}" >> "$temp_file"
+                add_host_record "$temp_file" "$external_name" "$fqdn"
                 entry_count=$((entry_count + 1))
             fi
         done < <(
             kubectl get svc -A \
                 -o jsonpath='{range .items[*]}{.metadata.namespace}{"\t"}{.metadata.name}{"\t"}{.spec.type}{"\t"}{.status.loadBalancer.ingress[*].ip}{"\t"}{.spec.externalName}{"\n"}{end}'
         )
+
+        if [[ -n "$traefik_ip" ]]; then
+            while IFS=$'\t' read -r namespace name hosts; do
+                [[ -z "$hosts" ]] && continue
+                for host in $hosts; do
+                    [[ -n "$host" ]] || continue
+                    add_host_record "$temp_file" "$traefik_ip" "$host"
+                    entry_count=$((entry_count + 1))
+                done
+            done < <(
+                kubectl get ingress -A \
+                    -o jsonpath='{range .items[*]}{.metadata.namespace}{"\t"}{.metadata.name}{"\t"}{range .spec.rules[*]}{.host}{" "}{end}{"\n"}{end}'
+            )
+
+            while IFS=$'\t' read -r namespace name matches; do
+                [[ -z "$matches" ]] && continue
+                while IFS= read -r host; do
+                    [[ -n "$host" ]] || continue
+                    add_host_record "$temp_file" "$traefik_ip" "$host"
+                    entry_count=$((entry_count + 1))
+                done < <(
+                    printf '%s\n' "$matches" | \
+                        grep -oE 'Host\(`[^`]+`\)' | \
+                        sed -E 's/^Host\(`//; s/`\)$//'
+                )
+            done < <(
+                {
+                    kubectl get ingressroute.traefik.io -A \
+                        -o jsonpath='{range .items[*]}{.metadata.namespace}{"\t"}{.metadata.name}{"\t"}{range .spec.routes[*]}{.match}{" "}{end}{"\n"}{end}' 2>/dev/null || true
+                    kubectl get ingressroute.traefik.containo.us -A \
+                        -o jsonpath='{range .items[*]}{.metadata.namespace}{"\t"}{.metadata.name}{"\t"}{range .spec.routes[*]}{.match}{" "}{end}{"\n"}{end}' 2>/dev/null || true
+                }
+            )
+        fi
         
         mv -f "$temp_file" "$HOSTS_FILE"
         log "wrote ${entry_count} entries to ${HOSTS_FILE}"
@@ -150,7 +246,8 @@ spec:
               apt-get update && \
               apt-get install -y --no-install-recommends bash ca-certificates curl procps && \
               KUBECTL_VERSION="$(curl -fsSL https://dl.k8s.io/release/stable.txt)" && \
-              curl -fsSL -o /usr/local/bin/kubectl "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/amd64/kubectl" && \
+              KUBECTL_ARCH="$(dpkg --print-architecture)" && \
+              curl -fsSL -o /usr/local/bin/kubectl "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/${KUBECTL_ARCH}/kubectl" && \
               chmod 0755 /usr/local/bin/kubectl && \
               exec /bin/bash /opt/sync.sh
           volumeMounts:
@@ -187,6 +284,12 @@ metadata:
 rules:
   - apiGroups: [""]
     resources: ["services"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["networking.k8s.io"]
+    resources: ["ingresses"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["traefik.io", "traefik.containo.us"]
+    resources: ["ingressroutes"]
     verbs: ["get", "list", "watch"]
 
 ---
