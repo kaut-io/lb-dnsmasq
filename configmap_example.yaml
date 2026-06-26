@@ -13,3 +13,11 @@ data:
   TRAEFIK_NAMESPACE: "traefik"
   # Set this to the Traefik service name used for ingress routing.
   TRAEFIK_SERVICE: "traefik"
+  # Optional: set this to a second Traefik service for internal-only ingress routes.
+  TRAEFIK_INTERNAL_SERVICE: "traefik-internal"
+  # Optional: ingressroutes using these entryPoints resolve to TRAEFIK_INTERNAL_SERVICE.
+  TRAEFIK_INTERNAL_ENTRYPOINTS: "internal web-internal websecure-internal"
+  # Optional: static vanity aliases served by k8s-dnsmasq.
+  # Each line may use either alias=target or alias target.
+  K8S_DNS_CNAME_RECORDS: |
+    app.example.test=app-service.default.example.internal
